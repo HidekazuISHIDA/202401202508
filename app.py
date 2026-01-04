@@ -180,9 +180,15 @@ def main():
         if not p.exists():
             missing.append(p.name)
     if missing:
-        st.error("必要ファイルが不足しています。models/ に以下を配置してください：
-- " + "
-- ".join(missing))
+        st.error(
+    """必要ファイルが不足しています。
+models/ に以下を配置してください：
+
+- model_A_timeseries.json
+- columns_A_timeseries.json
+"""
+)
+
         st.stop()
 
     if run:
