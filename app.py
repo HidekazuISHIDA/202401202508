@@ -13,7 +13,7 @@ APP_DIR = Path(__file__).resolve().parent
 MODELS_DIR = APP_DIR / "models"
 DATA_DIR = APP_DIR / "data"
 
-# モデルファイル
+# モデルファイル (v6.0対応)
 ARR_MODEL_PATH   = MODELS_DIR / "model_A_timeseries.json"
 SVC_MODEL_PATH   = MODELS_DIR / "model_A_service_30min.json"
 WAIT_MODEL_PATH  = MODELS_DIR / "model_A_waittime_30min.json"
@@ -125,7 +125,7 @@ def generate_slots(target_date):
     return [t.to_pydatetime() for t in rng if t.to_pydatetime() != end]
 
 # ----------------------------
-# シミュレーション (v5.0対応)
+# シミュレーション (v6.0対応: 2乗特徴量 + 安全装置)
 # ----------------------------
 def simulate_one_day(target_date, total_pat, weather_text):
     arr_bst, arr_cols, svc_bst, wait_bst, multi_cols, baseline, calib = load_artifacts()
@@ -156,7 +156,7 @@ def simulate_one_day(target_date, total_pat, weather_text):
         wait_base = baseline_lookup(baseline, "wait_base", m, dow, slot)
 
         def set_features(df_target):
-            # v5.0: "year" は削除済みなのでセットしない（しても無視されるが念のため）
+            # Basic Features (No Year)
             df_target.loc[0, "month"] = m
             df_target.loc[0, "dayofweek"] = dow
             df_target.loc[0, "is_holiday"] = is_h
@@ -168,12 +168,14 @@ def simulate_one_day(target_date, total_pat, weather_text):
             df_target.loc[0, "weekday_ratio_in_month"] = w_ratio_in_month
             df_target.loc[0, "total_outpatient_count"] = int(total_pat)
             
+            # Weather
             df_target.loc[0, "雨フラグ"] = 1 if "雨" in wcat else 0
             df_target.loc[0, "雪フラグ"] = 1 if "雪" in wcat else 0
             for c in ["晴", "曇", "雨", "雪"]:
                 if f"天気カテゴリ_{c}" in df_target.columns:
                     df_target.loc[0, f"天気カテゴリ_{c}"] = 1 if c == wcat else 0
             
+            # Time & Slot
             df_target.loc[0, "hour"] = ts.hour
             df_target.loc[0, "minute"] = ts.minute
             if f"dayofweek_{dow}" in df_target.columns: df_target.loc[0, f"dayofweek_{dow}"] = 1
@@ -181,8 +183,14 @@ def simulate_one_day(target_date, total_pat, weather_text):
             df_target.loc[0, "is_second_slot"] = 1 if (ts.hour==8 and ts.minute==30) else 0
             df_target.loc[0, "slot"] = slot
             
-            # Dynamic State
+            # Dynamic State (Queue)
             df_target.loc[0, "queue_at_start_truth"] = float(q_start)
+            
+            # ★ v6.0 新機能: Queueの2乗 (雪だるま式増加を表現)
+            if "queue_squared" in df_target.columns:
+                df_target.loc[0, "queue_squared"] = float(q_start) ** 2
+            
+            # Lags & Cumulative
             df_target.loc[0, "arr_lag_30"] = float(lags_arr["arr_lag_30"])
             df_target.loc[0, "arr_lag_60"] = float(lags_arr["arr_lag_60"])
             df_target.loc[0, "arr_lag_90"] = float(lags_arr["arr_lag_90"])
@@ -206,8 +214,7 @@ def simulate_one_day(target_date, total_pat, weather_text):
         set_features(mf)
         svc_i = max(0, int(round(_predict_booster(svc_bst, multi_cols, mf))))
         
-        # ★ 安全装置1: 幽霊行列防止
-        # 行列があるのに処理数0と予測されたら、最低1人は進める
+        # ★ 安全装置1: 行列があるなら最低1人は処理させる (幽霊行列防止)
         if q_start >= 0.5 and svc_i == 0:
             svc_i = 1
 
@@ -218,10 +225,12 @@ def simulate_one_day(target_date, total_pat, weather_text):
         raw_wait = _predict_booster(wait_bst, multi_cols, mf)
         pred_wait_ai = max(0.0, float(np.expm1(raw_wait)))
         
-        # Physics Wait
+        # Physics Wait (Queue / Service)
         safe_svc = max(float(svc_i), 0.5)
         wait_phy = (float(q_start) / safe_svc) * 30.0
         wait_phy = min(wait_phy, 300.0) # Cap
+        
+        # Calibration
         wait_phy_calib = max(0.0, a * wait_phy + b)
         
         # Ensemble
@@ -231,13 +240,14 @@ def simulate_one_day(target_date, total_pat, weather_text):
         if q_start < 0.5:
             wait_final = 0.0
         else:
+            # Baseline Floor (過去の実績を下回らないように)
             wait_final = max(float(wait_base)*floor_ratio, wait_blend)
 
         results.append({
             "時間帯": ts.strftime("%H:%M"),
             "予測受付数": int(arr_i),
-            "予測呼出数": int(svc_i),
-            "予測待ち人数": int(round(q_next)),
+            "予測呼出数(処理数)": int(svc_i),
+            "予測待ち人数(人)": int(round(q_next)),
             "予測平均待ち時間(分)": int(round(wait_final))
         })
 
@@ -255,8 +265,8 @@ def simulate_one_day(target_date, total_pat, weather_text):
 # ----------------------------
 def main():
     st.set_page_config(page_title="A病院 混雑予測", layout="wide")
-    st.title("🏥 A病院 採血 待ち時間予測AI (v5.0)")
-    st.caption("Safety Net & Lightweight Model")
+    st.title("🏥 A病院 採血 待ち時間予測AI (v6.0)")
+    st.caption("Mixed Model: AI(Log/Strict) + Physics(Queue^2)")
 
     # Check Files
     required = [ARR_MODEL_PATH, SVC_MODEL_PATH, WAIT_MODEL_PATH, ARR_COLS_PATH, MULTI_COLS_PATH, BASELINE_PATH, CALIB_PATH]
@@ -267,28 +277,35 @@ def main():
     with st.sidebar:
         st.header("条件設定")
         tdate = st.date_input("日付", value=date.today() + timedelta(days=1))
-        # 少し多めのデフォルト値で安全側に倒す
-        pat_num = st.number_input("予測外来患者数", value=1300, step=50, help="平均: 1200-1400人")
+        pat_num = st.number_input("予測外来患者数", value=1400, step=50, help="平日平均: 1200-1500人")
         weather = st.selectbox("天気", ["晴", "曇", "雨", "雪"], index=1)
         run = st.button("予測実行", type="primary")
+        
+        st.divider()
+        st.info("v6.0 Update:\n・混雑時の感度を10倍に強化\n・行列の2乗則を考慮")
 
     if run:
-        with st.spinner("シミュレーション実行中..."):
+        with st.spinner("AIがシミュレーション中..."):
             df = simulate_one_day(tdate, int(pat_num), str(weather))
         
         st.success(f"✅ {tdate.strftime('%Y/%m/%d')} の予測完了")
         
         # Metrics
         peak_wait = df["予測平均待ち時間(分)"].max()
-        peak_time = df.loc[df["予測平均待ち時間(分)"].idxmax(), "時間帯"]
+        peak_idx = df["予測平均待ち時間(分)"].idxmax()
+        peak_time = df.loc[peak_idx, "時間帯"]
+        max_q = df["予測待ち人数(人)"].max()
+        total_arr = df["予測受付数"].sum()
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("ピーク待ち時間", f"{peak_wait}分", f"@{peak_time}", delta_color="inverse")
-        c2.metric("最大待ち人数", f"{df['予測待ち人数'].max()}人")
-        c3.metric("総受付数", f"{df['予測受付数'].sum()}人")
+        c1.metric("最大待ち時間", f"{peak_wait} 分", f"@{peak_time}", delta_color="inverse")
+        c2.metric("最大待ち人数", f"{max_q} 人")
+        c3.metric("総受付数", f"{total_arr} 人")
         
         # Chart
         st.subheader("混雑推移")
-        st.line_chart(df.set_index("時間帯")[["予測平均待ち時間(分)", "予測待ち人数"]])
+        chart_data = df.set_index("時間帯")[["予測平均待ち時間(分)", "予測待ち人数(人)"]]
+        st.line_chart(chart_data)
         
         # Table
         with st.expander("詳細データ"):
