@@ -7,15 +7,17 @@ import streamlit as st
 import xgboost as xgb
 
 # ----------------------------
-# 設定・パス定義
+# 設定
 # ----------------------------
 APP_DIR = Path(__file__).resolve().parent
 MODELS_DIR = APP_DIR / "models"
 DATA_DIR = APP_DIR / "data"
 
-ARR_MODEL_PATH   = MODELS_DIR / "model_A_timeseries.json"
-SVC_MODEL_PATH   = MODELS_DIR / "model_A_service_30min.json"
-WAIT_MODEL_PATH  = MODELS_DIR / "model_A_waittime_30min.json"
+# ★ここが変更点: 拡張子を .ubj に
+ARR_MODEL_PATH   = MODELS_DIR / "model_A_timeseries.ubj"
+SVC_MODEL_PATH   = MODELS_DIR / "model_A_service_30min.ubj"
+WAIT_MODEL_PATH  = MODELS_DIR / "model_A_waittime_30min.ubj"
+
 ARR_COLS_PATH    = MODELS_DIR / "columns_A_timeseries.json"
 MULTI_COLS_PATH  = MODELS_DIR / "columns_A_multi_30min.json"
 BASELINE_PATH    = MODELS_DIR / "baseline_tables_mds.json"
@@ -65,9 +67,12 @@ def month_weekday_counts(y, m):
 def load_artifacts():
     arr_cols = json.loads(ARR_COLS_PATH.read_text(encoding="utf-8"))
     multi_cols = json.loads(MULTI_COLS_PATH.read_text(encoding="utf-8"))
+    
+    # .ubj 読み込み
     arr_bst = xgb.Booster(); arr_bst.load_model(str(ARR_MODEL_PATH))
     svc_bst = xgb.Booster(); svc_bst.load_model(str(SVC_MODEL_PATH))
     wait_bst = xgb.Booster(); wait_bst.load_model(str(WAIT_MODEL_PATH))
+    
     baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
     calib = json.loads(CALIB_PATH.read_text(encoding="utf-8"))
     return arr_bst, arr_cols, svc_bst, wait_bst, multi_cols, baseline, calib
@@ -92,7 +97,7 @@ def generate_slots(target_date):
     return [t.to_pydatetime() for t in rng if t.to_pydatetime() != end] if not INCLUDE_CLOSE else list(rng)
 
 # ----------------------------
-# シミュレーション (v7.0)
+# シミュレーション
 # ----------------------------
 def simulate_one_day(target_date, total_pat, weather_text, efficiency_rate=1.0):
     arr_bst, arr_cols, svc_bst, wait_bst, multi_cols, baseline, calib = load_artifacts()
@@ -113,7 +118,7 @@ def simulate_one_day(target_date, total_pat, weather_text, efficiency_rate=1.0):
     
     for ts in generate_slots(target_date):
         slot = slot_index(ts)
-        # Base DataFrame Construction
+        # Base DataFrame
         def make_base_df(cols_list):
             df = _make_zero_df(cols_list)
             df.loc[0, "month"] = m
@@ -139,8 +144,8 @@ def simulate_one_day(target_date, total_pat, weather_text, efficiency_rate=1.0):
             df.loc[0, "is_second_slot"] = 1 if (ts.hour==8 and ts.minute==30) else 0
             df.loc[0, "slot"] = slot
             
+            # Dynamic
             df.loc[0, "queue_at_start_truth"] = float(q_start)
-            # v7.0: 2乗特徴量
             if "queue_squared" in df.columns: df.loc[0, "queue_squared"] = float(q_start) ** 2
             
             # Lags
@@ -164,21 +169,17 @@ def simulate_one_day(target_date, total_pat, weather_text, efficiency_rate=1.0):
         cf = make_base_df(arr_cols)
         arr_i = max(0, int(round(_predict_booster(arr_bst, arr_cols, cf))))
 
-        # 2. Service & Wait (Need updated features)
+        # 2. Service & Wait
         mf = make_base_df(multi_cols)
-        
-        # ★ v7.0: 新特徴量 (受付数確定後にセット)
         if "arr_diff" in mf.columns:
-            # 今回の予測受付 - 前回の受付 (勢い)
             mf.loc[0, "arr_diff"] = float(arr_i) - float(lags_arr["arr_lag_30"])
         if "queue_density" in mf.columns:
-            # 混雑密度 = 行列 / (今回の受付 + 1)
             mf.loc[0, "queue_density"] = float(q_start) / (float(arr_i) + 1.0)
 
         # Service Predict
         raw_svc = _predict_booster(svc_bst, multi_cols, mf)
         svc_i = max(0, int(round(raw_svc * efficiency_rate)))
-        if q_start >= 0.5 and svc_i == 0: svc_i = 1 # Ghost queue prevention
+        if q_start >= 0.5 and svc_i == 0: svc_i = 1
 
         q_next = max(0.0, float(q_start) + float(arr_i) - float(svc_i))
 
@@ -191,9 +192,7 @@ def simulate_one_day(target_date, total_pat, weather_text, efficiency_rate=1.0):
         wait_phy_calib = max(0.0, a * wait_phy + b)
         
         wait_blend = alpha * pred_wait_ai + (1.0 - alpha) * wait_phy_calib
-        
-        wait_base_val = baseline_lookup(baseline, "wait_base", m, dow, slot)
-        wait_final = 0.0 if q_start < 0.5 else max(float(wait_base_val)*floor_ratio, wait_blend)
+        wait_final = 0.0 if q_start < 0.5 else max(float(baseline_lookup(baseline, "wait_base", m, dow, slot))*floor_ratio, wait_blend)
 
         results.append({
             "時間帯": ts.strftime("%H:%M"),
@@ -213,8 +212,8 @@ def simulate_one_day(target_date, total_pat, weather_text, efficiency_rate=1.0):
 
 def main():
     st.set_page_config(page_title="A病院 混雑予測", layout="wide")
-    st.title("🏥 A病院 採血 待ち時間予測AI (v7.0)")
-    st.caption("Deep Learning & Efficiency Control")
+    st.title("🏥 A病院 採血 待ち時間予測AI (v7.1)")
+    st.caption("UBJ Format: High Precision & Light Size")
 
     required = [ARR_MODEL_PATH, SVC_MODEL_PATH, WAIT_MODEL_PATH, ARR_COLS_PATH, MULTI_COLS_PATH, BASELINE_PATH, CALIB_PATH]
     if any(not p.exists() for p in required):
@@ -231,7 +230,7 @@ def main():
         run = st.button("予測実行", type="primary")
 
     if run:
-        with st.spinner("AI演算中 (v7.0 Model)..."):
+        with st.spinner("AI演算中 (v7.1)..."):
             df = simulate_one_day(tdate, int(pat_num), str(weather), eff/100.0)
         
         st.success(f"✅ {tdate.strftime('%Y/%m/%d')} 予測完了")
@@ -246,7 +245,7 @@ def main():
         st.line_chart(df.set_index("時間帯")[["予測平均待ち時間(分)", "予測待ち人数"]])
         with st.expander("詳細データ"):
             st.dataframe(df.style.highlight_max(axis=0, color="#fffdc9"), use_container_width=True)
-            st.download_button("CSV保存", df.to_csv(index=False).encode('utf-8-sig'), f"pred_v7_{tdate}.csv", "text/csv")
+            st.download_button("CSV保存", df.to_csv(index=False).encode('utf-8-sig'), f"pred_{tdate}.csv", "text/csv")
 
 if __name__ == "__main__":
     main()
