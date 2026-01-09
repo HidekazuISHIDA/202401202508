@@ -1,1 +1,0 @@
-{"a": 0.9112252058104073, "b": -13.230354201485293, "alpha_base": 0.6, "alpha_peak": 0.25, "formula": "wait_phy = (queue_start + 0.5*arrivals)/max(service,1)*30"}
