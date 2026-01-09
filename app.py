@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from datetime import date, timedelta, datetime
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -10,12 +11,13 @@ APP_DIR = Path(__file__).resolve().parent
 MODELS_DIR = APP_DIR / "models"
 DATA_DIR = APP_DIR / "data"
 
+# ===== filenames (match your training outputs) =====
 ARR_MODEL_PATH  = MODELS_DIR / "model_A_timeseries.json"
 ARR_COLS_PATH   = MODELS_DIR / "columns_A_timeseries.json"
 
-SVC_MODEL_PATH  = MODELS_DIR / "model_A_service_30min.json"
-WAIT_MEAN_PATH  = MODELS_DIR / "model_A_waittime_30min.json"
-WAIT_P90_PATH   = MODELS_DIR / "model_A_waittime_p90_30min.json"  # optional
+SVC_MODEL_PATH  = MODELS_DIR / "model_A_service_30min.json"   # ★ service model
+WAIT_MEAN_PATH  = MODELS_DIR / "model_A_waittime_30min.json"  # mean wait
+WAIT_P90_PATH   = MODELS_DIR / "model_A_waittime_p90_30min.json"  # optional but recommended
 
 MULTI_COLS_PATH = MODELS_DIR / "columns_A_multi_30min.json"
 BASELINE_PATH   = MODELS_DIR / "baseline_tables_mds.json"
@@ -23,23 +25,30 @@ CALIB_PATH      = MODELS_DIR / "wait_calibration.json"
 
 HOLIDAY_CSV_PATH = DATA_DIR / "syukujitsu.csv"  # optional
 
+# ===== time config =====
 OPEN_HOUR = 8
 CLOSE_HOUR = 18
 FREQ_MIN = 30
 SLOT_MIN = 30.0
 
+# ===== safety bounds =====
 WAIT_MAX = 180.0
-SERVICE_MIN = 1.0
+SERVICE_MIN = 0.0   # allow 0, but we will stabilize by fallback/cap
+ARR_MAX = 300        # safety only (won't matter usually)
 
 WEATHER_CATS = ["晴", "曇", "雨", "雪"]
 
-# ---- Peak window you care about
+# ===== peak window =====
 PEAK_START = (8, 30)
-PEAK_END   = (11, 0)   # inclusive boundary for applying correction
+PEAK_END   = (11, 0)   # inclusive
 
-# =========================
+# ===== congestion factor clamp (weakened) =====
+CONGESTION_CLAMP = (0.90, 1.20)   # ★ too wide will explode; keep narrow
+
+
+# -------------------------
 # Holiday
-# =========================
+# -------------------------
 def _load_holidays() -> set:
     if not HOLIDAY_CSV_PATH.exists():
         return set()
@@ -84,14 +93,14 @@ def baseline_key(month: int, dow: int, slot_id: int) -> str:
 
 def in_peak(ts: datetime) -> bool:
     h, m = ts.hour, ts.minute
-    # apply from 08:30 to 11:00
     after_start = (h > PEAK_START[0]) or (h == PEAK_START[0] and m >= PEAK_START[1])
     before_end  = (h < PEAK_END[0]) or (h == PEAK_END[0] and m <= PEAK_END[1])
     return after_start and before_end
 
-# =========================
+
+# -------------------------
 # Load assets
-# =========================
+# -------------------------
 @st.cache_resource
 def load_assets():
     arr_cols = json.loads(ARR_COLS_PATH.read_text(encoding="utf-8"))
@@ -145,70 +154,68 @@ def add_common(dfrow: pd.DataFrame, ts: datetime, target_date: date):
     month = ts.month
     sid = slot_id_from_ts(ts)
 
-    if "hour" in dfrow.columns: dfrow.loc[0,"hour"] = int(ts.hour)
-    if "minute" in dfrow.columns: dfrow.loc[0,"minute"] = int(ts.minute)
-    if "dow" in dfrow.columns: dfrow.loc[0,"dow"] = int(dow)
-    if "month" in dfrow.columns: dfrow.loc[0,"month"] = int(month)
-    if "slot_id" in dfrow.columns: dfrow.loc[0,"slot_id"] = int(sid)
+    if "hour" in dfrow.columns: dfrow.loc[0, "hour"] = int(ts.hour)
+    if "minute" in dfrow.columns: dfrow.loc[0, "minute"] = int(ts.minute)
+    if "dow" in dfrow.columns: dfrow.loc[0, "dow"] = int(dow)
+    if "month" in dfrow.columns: dfrow.loc[0, "month"] = int(month)
+    if "slot_id" in dfrow.columns: dfrow.loc[0, "slot_id"] = int(sid)
 
-    if "月" in dfrow.columns: dfrow.loc[0,"月"] = int(month)
-    if "週回数" in dfrow.columns: dfrow.loc[0,"週回数"] = int(week_of_month(target_date))
+    if "月" in dfrow.columns: dfrow.loc[0, "月"] = int(month)
+    if "週回数" in dfrow.columns: dfrow.loc[0, "週回数"] = int(week_of_month(target_date))
 
     for k in range(7):
         c = f"dayofweek_{k}"
         if c in dfrow.columns:
-            dfrow.loc[0,c] = 1 if k == dow else 0
+            dfrow.loc[0, c] = 1 if k == dow else 0
 
     if "is_first_slot" in dfrow.columns:
-        dfrow.loc[0,"is_first_slot"] = 1 if (ts.hour==8 and ts.minute==0) else 0
+        dfrow.loc[0, "is_first_slot"] = 1 if (ts.hour == 8 and ts.minute == 0) else 0
     if "is_second_slot" in dfrow.columns:
-        dfrow.loc[0,"is_second_slot"] = 1 if (ts.hour==8 and ts.minute==30) else 0
+        dfrow.loc[0, "is_second_slot"] = 1 if (ts.hour == 8 and ts.minute == 30) else 0
 
     return sid, month, dow
 
 def add_calendar(dfrow: pd.DataFrame, d: date):
     if "is_holiday" in dfrow.columns:
-        dfrow.loc[0,"is_holiday"] = int(is_holiday(d))
+        dfrow.loc[0, "is_holiday"] = int(is_holiday(d))
     prev = d - timedelta(days=1)
     if "前日祝日フラグ" in dfrow.columns:
-        dfrow.loc[0,"前日祝日フラグ"] = int(is_holiday(prev))
+        dfrow.loc[0, "前日祝日フラグ"] = int(is_holiday(prev))
 
 def add_weather(dfrow: pd.DataFrame, w: str):
     w = normalize_weather(w)
-    if "雨フラグ" in dfrow.columns: dfrow.loc[0,"雨フラグ"] = 1 if w=="雨" else 0
-    if "雪フラグ" in dfrow.columns: dfrow.loc[0,"雪フラグ"] = 1 if w=="雪" else 0
+    if "雨フラグ" in dfrow.columns: dfrow.loc[0, "雨フラグ"] = 1 if w == "雨" else 0
+    if "雪フラグ" in dfrow.columns: dfrow.loc[0, "雪フラグ"] = 1 if w == "雪" else 0
     for cat in WEATHER_CATS:
         c = f"天気カテゴリ_{cat}"
         if c in dfrow.columns:
-            dfrow.loc[0,c] = 1 if w==cat else 0
+            dfrow.loc[0, c] = 1 if w == cat else 0
 
 def add_outpatient(dfrow: pd.DataFrame, total_out: int):
     if "total_outpatient_count" in dfrow.columns:
-        dfrow.loc[0,"total_outpatient_count"] = int(total_out)
+        dfrow.loc[0, "total_outpatient_count"] = int(total_out)
 
 def add_state(dfrow: pd.DataFrame, queue0: float, cum_arr: float):
+    # training had these columns; inference uses predicted values
     if "queue_at_start_truth" in dfrow.columns:
-        dfrow.loc[0,"queue_at_start_truth"] = float(queue0)
+        dfrow.loc[0, "queue_at_start_truth"] = float(queue0)
     if "cum_arrivals_sofar" in dfrow.columns:
-        dfrow.loc[0,"cum_arrivals_sofar"] = float(cum_arr)
+        dfrow.loc[0, "cum_arrivals_sofar"] = float(cum_arr)
 
-def add_lags_arr(dfrow: pd.DataFrame, lags: dict):
-    for k,v in lags.items():
+def add_lags(dfrow: pd.DataFrame, lags: dict, roll60_name: str):
+    for k, v in lags.items():
         if k in dfrow.columns:
-            dfrow.loc[0,k] = float(v)
-    if "arr_roll_60" in dfrow.columns:
-        dfrow.loc[0,"arr_roll_60"] = (float(lags["arr_lag_30"]) + float(lags["arr_lag_60"])) / 2.0
+            dfrow.loc[0, k] = float(v)
+    if roll60_name in dfrow.columns:
+        # expects keys *_lag_30 and *_lag_60
+        k30 = [k for k in lags.keys() if k.endswith("lag_30")][0]
+        k60 = [k for k in lags.keys() if k.endswith("lag_60")][0]
+        dfrow.loc[0, roll60_name] = (float(lags[k30]) + float(lags[k60])) / 2.0
 
-def add_lags_svc(dfrow: pd.DataFrame, lags: dict):
-    for k,v in lags.items():
-        if k in dfrow.columns:
-            dfrow.loc[0,k] = float(v)
-    if "svc_roll_60" in dfrow.columns:
-        dfrow.loc[0,"svc_roll_60"] = (float(lags["svc_lag_30"]) + float(lags["svc_lag_60"])) / 2.0
 
-# =========================
+# -------------------------
 # Simulation
-# =========================
+# -------------------------
 def simulate_one_day(target_date: date, total_out: int, weather: str) -> pd.DataFrame:
     bst_arr, arr_cols, bst_svc, bst_wm, bst_wp90, multi_cols, baseline, calib = load_assets()
     a, b, blend_alpha = calib
@@ -220,101 +227,104 @@ def simulate_one_day(target_date: date, total_out: int, weather: str) -> pd.Data
     if slots and slots[-1].hour == CLOSE_HOUR and slots[-1].minute == 0:
         slots = slots[:-1]
 
-    arr_lags = {"arr_lag_30":0.0,"arr_lag_60":0.0,"arr_lag_90":0.0}
-    svc_lags = {"svc_lag_30":0.0,"svc_lag_60":0.0,"svc_lag_90":0.0}
+    arr_lags = {"arr_lag_30": 0.0, "arr_lag_60": 0.0, "arr_lag_90": 0.0}
+    svc_lags = {"svc_lag_30": 0.0, "svc_lag_60": 0.0, "svc_lag_90": 0.0}
 
     queue0 = 0.0
     cum_arr = 0.0
 
-    # ---- day congestion factor from first 2 slots (08:00, 08:30) vs baseline
+    # --- congestion factor from first 2 slots vs baseline
     congestion_factor = 1.0
+    first_two = []
 
     rows = []
-    first_two_preds = []
 
     for ts in slots:
-        sid = slot_id_from_ts(ts)
-        dow = ts.weekday()
-        mo  = ts.month
+        sid, month, dow = slot_id_from_ts(ts), ts.month, ts.weekday()
+        base_arr, base_svc, base_wm, base_wp = get_baseline(baseline, month, dow, sid)
 
-        base_arr, base_svc, base_wm, base_wp = get_baseline(baseline, mo, dow, sid)
-
-        # -------- arrivals
+        # ========== arrivals ==========
         af = _make_zero_df(arr_cols)
         add_common(af, ts, target_date)
         add_calendar(af, target_date)
         add_outpatient(af, total_out)
         add_weather(af, weather)
         add_state(af, queue0, cum_arr)
-        add_lags_arr(af, arr_lags)
+        add_lags(af, arr_lags, "arr_roll_60")
 
         pred_arr = max(0.0, _predict(bst_arr, arr_cols, af))
         arr_i = int(round(pred_arr))
-        arr_i = max(0, arr_i)
+        arr_i = int(np.clip(arr_i, 0, ARR_MAX))
 
-        # compute congestion factor after first 2 slots
-        if sid in (0,1):
-            first_two_preds.append((sid, arr_i, base_arr))
-            if len(first_two_preds)==2:
-                p = sum(x[1] for x in first_two_preds)
-                b0 = sum(max(1.0, x[2]) for x in first_two_preds)
-                ratio = p / b0
-                # clamp (too aggressive is harmful)
-                congestion_factor = float(np.clip(ratio, 0.85, 1.35))
+        # estimate congestion factor after slot0+slot1
+        if sid in (0, 1):
+            first_two.append((arr_i, max(1.0, base_arr)))
+            if len(first_two) == 2:
+                ratio = (first_two[0][0] + first_two[1][0]) / (first_two[0][1] + first_two[1][1])
+                congestion_factor = float(np.clip(ratio, CONGESTION_CLAMP[0], CONGESTION_CLAMP[1]))
 
-        # apply congestion to peak arrivals slightly (reflect “9時までで分岐”)
+        # apply mild congestion to arrivals in peak
         if in_peak(ts):
             arr_i = int(round(arr_i * congestion_factor))
-            arr_i = max(0, arr_i)
 
-        # -------- service
+        # ========== service ==========
         sf = _make_zero_df(multi_cols)
         add_common(sf, ts, target_date)
         add_calendar(sf, target_date)
         add_outpatient(sf, total_out)
         add_weather(sf, weather)
         add_state(sf, queue0, cum_arr)
-        add_lags_arr(sf, arr_lags)
-        add_lags_svc(sf, svc_lags)
+        add_lags(sf, arr_lags, "arr_roll_60")
+        add_lags(sf, svc_lags, "svc_roll_60")
 
         pred_svc = max(0.0, _predict(bst_svc, multi_cols, sf))
         svc_i = int(round(pred_svc))
-        svc_i = max(0, svc_i)
+        svc_i = max(int(SERVICE_MIN), svc_i)
 
-        # peak congestion: service tends to be “effective lower”
+        # ★IMPORTANT FIX:
+        # service cannot exceed available people (queue0 + arrivals)
+        available = int(round(queue0)) + int(arr_i)
+        svc_i = min(svc_i, max(0, available))
+
+        # peak congestion: effective service slightly lower (mild)
         if in_peak(ts):
             svc_i = int(round(svc_i / congestion_factor))
-            svc_i = max(0, svc_i)
+            svc_i = min(svc_i, max(0, available))
 
-        # -------- queue (conservation)
-        queue_end = max(0.0, queue0 + arr_i - svc_i)
+        # optional fallback: if service becomes 0 while there are people, use baseline
+        if svc_i == 0 and available > 0:
+            svc_i = int(round(min(available, max(1.0, base_svc))))
 
-        # -------- wait mean (blend ML + physics)
+        # ========== queue (conservation) ==========
+        queue_end = max(0.0, queue0 + float(arr_i) - float(svc_i))
+
+        # ========== wait mean ==========
         wf = _make_zero_df(multi_cols)
         add_common(wf, ts, target_date)
         add_calendar(wf, target_date)
         add_outpatient(wf, total_out)
         add_weather(wf, weather)
         add_state(wf, queue0, cum_arr)
-        add_lags_arr(wf, arr_lags)
-        add_lags_svc(wf, svc_lags)
+        add_lags(wf, arr_lags, "arr_roll_60")
+        add_lags(wf, svc_lags, "svc_roll_60")
 
         wait_model = max(0.0, _predict(bst_wm, multi_cols, wf))
 
-        svc_for_phy = max(SERVICE_MIN, float(svc_i))
+        # physics wait (queue / service)
+        svc_for_phy = max(1.0, float(svc_i))
         wait_phy = (float(queue0) / svc_for_phy) * SLOT_MIN
-        wait_phy_cal = max(0.0, a*wait_phy + b)
+        wait_phy_cal = max(0.0, a * wait_phy + b)
 
         wait_mean = blend_alpha * wait_model + (1.0 - blend_alpha) * wait_phy_cal
 
-        # congestion push in peak (no extra input)
+        # mild congestion push in peak
         if in_peak(ts):
             wait_mean *= congestion_factor
 
         wait_mean = float(np.clip(wait_mean, 0.0, WAIT_MAX))
 
-        # -------- wait p90
-        wait_p90 = None
+        # ========== wait p90 ==========
+        wait_p90 = np.nan
         if bst_wp90 is not None:
             wp = max(0.0, _predict(bst_wp90, multi_cols, wf))
             if in_peak(ts):
@@ -327,24 +337,33 @@ def simulate_one_day(target_date: date, total_out: int, weather: str) -> pd.Data
             "予測処理数(呼出数)": int(svc_i),
             "予測待ち人数(人)": int(round(queue0)),
             "予測平均待ち時間(分)": int(round(wait_mean)),
-            "予測混雑時待ち時間_p90(分)": (int(round(wait_p90)) if wait_p90 is not None else np.nan),
+            "予測混雑時待ち時間_p90(分)": (int(round(wait_p90)) if not np.isnan(wait_p90) else np.nan),
         })
 
         # update states
         cum_arr += float(arr_i)
-        arr_lags = {"arr_lag_30": float(arr_i), "arr_lag_60": float(arr_lags["arr_lag_30"]), "arr_lag_90": float(arr_lags["arr_lag_60"])}
-        svc_lags = {"svc_lag_30": float(svc_i), "svc_lag_60": float(svc_lags["svc_lag_30"]), "svc_lag_90": float(svc_lags["svc_lag_60"])}
+        arr_lags = {
+            "arr_lag_30": float(arr_i),
+            "arr_lag_60": float(arr_lags["arr_lag_30"]),
+            "arr_lag_90": float(arr_lags["arr_lag_60"]),
+        }
+        svc_lags = {
+            "svc_lag_30": float(svc_i),
+            "svc_lag_60": float(svc_lags["svc_lag_30"]),
+            "svc_lag_90": float(svc_lags["svc_lag_60"]),
+        }
         queue0 = queue_end
 
     return pd.DataFrame(rows), congestion_factor
 
-# =========================
+
+# -------------------------
 # UI
-# =========================
+# -------------------------
 def main():
-    st.set_page_config(page_title="A病院 採血 待ち予測（最終版）", layout="wide")
-    st.title("🏥 A病院 採血 待ち人数・待ち時間 予測（最終版：mean + p90 / 朝9時混雑係数 / 保存則）")
-    st.caption("入力追加なし（予測日 / 外来数 / 簡易天気）。朝9時までの受付（予測）から混雑係数を推定してピークを補正します。")
+    st.set_page_config(page_title="A病院 採血 待ち予測（最終版・安定化）", layout="wide")
+    st.title("🏥 A病院 採血 待ち人数・待ち時間 予測（最終版・安定化）")
+    st.caption("追加入力なし。service予測を保存則でクリップして破綻を防ぎ、ピーク（8:30–11:00）は朝9時までの混雑係数で軽く補正します。")
 
     required = [
         ARR_MODEL_PATH, ARR_COLS_PATH,
@@ -387,7 +406,7 @@ def main():
         with c2:
             st.subheader("可視化")
             cols = ["予測平均待ち時間(分)"]
-            if "予測混雑時待ち時間_p90(分)" in df.columns and df["予測混雑時待ち時間_p90(分)"].notna().any():
+            if df["予測混雑時待ち時間_p90(分)"].notna().any():
                 cols.append("予測混雑時待ち時間_p90(分)")
             st.line_chart(df.set_index("時間帯")[cols])
             st.bar_chart(df.set_index("時間帯")[["予測待ち人数(人)"]])
