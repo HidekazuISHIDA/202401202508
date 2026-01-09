@@ -183,7 +183,7 @@ def simulate_one_day(
     # キャリブレーション設定
     a = float(calib.get("a", 1.0))
     b = float(calib.get("b", 0.0))
-    alpha = float(calib.get("alpha", 0.5))
+    alpha = float(calib.get("alpha", 0.4)) # 物理モデル重視
     floor_ratio = float(calib.get("floor_ratio", 0.9))
 
     results = []
@@ -260,11 +260,16 @@ def simulate_one_day(
         pred_svc = _predict_booster(svc_bst, multi_cols, mf)
         svc_i = max(0, int(round(pred_svc)))
 
+        # 【幽霊行列防止】
+        # 行列があるのに処理数が0になる場合、最低1人は処理させる
+        if queue_at_start >= 0.5 and svc_i == 0:
+            svc_i = 1
+
         # キュー更新
         q_next = max(0.0, float(queue_at_start) + float(arr_i) - float(svc_i))
 
         # --- 3. 待ち時間予測 (Wait) ---
-        # ★重要修正: 対数変換(log1p)で学習したので、expm1 で戻す
+        # ★重要: 対数変換(log1p)で学習したので、expm1 で戻す
         raw_pred = _predict_booster(wait_bst, multi_cols, mf)
         pred_wait_model = max(0.0, float(np.expm1(raw_pred)))
 
@@ -313,13 +318,13 @@ def simulate_one_day(
 # ----------------------------
 def main():
     st.set_page_config(page_title="A病院 混雑予測", layout="wide")
-    st.title("🏥 A病院 採血 待ち時間予測AI (v3.0)")
+    st.title("🏥 A病院 採血 待ち時間予測AI (v4.0)")
     st.markdown("""
     <style>
     .big-font { font-size: 24px !important; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
-    st.caption("AIモデル + 待ち行列理論ハイブリッド / ログ変換対応版")
+    st.caption("AIモデル + 待ち行列理論ハイブリッド / 過学習対策・軽量版")
 
     # ファイルチェック
     required_files = [
@@ -346,7 +351,7 @@ def main():
         run_btn = st.button("予測実行", type="primary")
         
         st.divider()
-        st.info(f"Model Version: v3.0\nWait Log-Transform: ON")
+        st.info(f"Model Version: v4.0\nBoost Rounds: 3000")
 
     if run_btn:
         with st.spinner("AIがシミュレーション中..."):
