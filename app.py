@@ -1,323 +1,361 @@
 import json
 from pathlib import Path
-from datetime import date, timedelta, datetime
-
-import numpy as np
+from datetime import date, datetime, timedelta
 import pandas as pd
+import numpy as np
 import streamlit as st
 import xgboost as xgb
 
+# パス設定
 APP_DIR = Path(__file__).resolve().parent
 MODELS_DIR = APP_DIR / "models"
+DATA_DIR = APP_DIR / "data"
 
-# -------------------------
-# Required files
-# -------------------------
-ARR_MODEL_PATH  = MODELS_DIR / "model_A_timeseries.json"
-ARR_COLS_PATH   = MODELS_DIR / "columns_A_timeseries.json"
+# ファイルパス定義
+ARR_MODEL_PATH   = MODELS_DIR / "model_A_timeseries.json"
+SVC_MODEL_PATH   = MODELS_DIR / "model_A_service_30min.json"
+WAIT_MODEL_PATH  = MODELS_DIR / "model_A_waittime_30min.json"
 
-SVC_MODEL_PATH  = MODELS_DIR / "model_A_service_30min.json"
-WAIT_MODEL_PATH = MODELS_DIR / "model_A_waittime_30min.json"
-MULTI_COLS_PATH = MODELS_DIR / "columns_A_multi_30min.json"
+ARR_COLS_PATH    = MODELS_DIR / "columns_A_timeseries.json"
+MULTI_COLS_PATH  = MODELS_DIR / "columns_A_multi_30min.json"
 
-BASELINE_PATH   = MODELS_DIR / "baseline_tables_mds.json"
-CALIB_PATH      = MODELS_DIR / "wait_calibration.json"
+BASELINE_PATH    = MODELS_DIR / "baseline_tables_mds.json"
+CALIB_PATH       = MODELS_DIR / "wait_calibration.json"
 
+# 祝日CSV (オプション)
+HOLIDAY_CSV_PATH = DATA_DIR / "syukujitsu.csv"
+
+# 設定
 OPEN_HOUR = 8
 CLOSE_HOUR = 18
 FREQ_MIN = 30
-INCLUDE_CLOSE = False  # 18:00枠は除外（08:00〜17:30）
+INCLUDE_CLOSE = False  # 18:00枠除外
 
-WEATHER_CATS = ["晴", "曇", "雨", "雪"]
+# ----------------------------
+# ヘルパー関数群
+# ----------------------------
+def _load_holidays() -> set:
+    """祝日CSVを読み込む（Shift-JIS/UTF-8両対応）"""
+    if not HOLIDAY_CSV_PATH.exists():
+        return set()
+    
+    df = None
+    # エンコーディング対応
+    for enc in ["cp932", "shift_jis", "utf-8"]:
+        try:
+            df = pd.read_csv(HOLIDAY_CSV_PATH, encoding=enc, engine="python")
+            break
+        except Exception:
+            continue
+            
+    if df is None:
+        return set()
 
-def _slot_id(ts: datetime) -> int:
-    minutes = ts.hour * 60 + ts.minute
-    return int((minutes - 8 * 60) // 30)
+    col = None
+    # 日付列を探す
+    for c in df.columns:
+        if str(c).strip().lower() in ["date", "日付", "国民の祝日・休日月日"]:
+            col = c
+            break
+    if col is None:
+        col = df.columns[0]
+    
+    s = pd.to_datetime(df[col], errors="coerce").dropna().dt.date
+    return set(s.tolist())
 
-def _baseline_key(ts: datetime) -> str:
-    # month_dayofweek_slot
-    return f"{ts.month}_{ts.weekday()}_{_slot_id(ts)}"
+HOLIDAYS = _load_holidays()
 
-def _normalize_weather(w: str) -> str:
-    s = str(w) if w is not None else ""
-    if "雪" in s: return "雪"
-    if "雨" in s: return "雨"
-    if "曇" in s: return "曇"
-    if "晴" in s: return "晴"
-    return "曇"
-
-def _is_holiday_like(d: date) -> bool:
-    # Streamlit側は追加入力なしの方針なので最低限
-    if d.weekday() >= 5:
-        return True
-    if (d.month == 12 and d.day >= 29) or (d.month == 1 and d.day <= 3):
-        return True
+def is_holiday(d: date) -> bool:
+    if d.weekday() >= 5: return True
+    if d in HOLIDAYS: return True
+    if (d.month == 12 and d.day >= 29) or (d.month == 1 and d.day <= 3): return True
     return False
 
-def _week_of_month(d: date) -> int:
-    return int((d.day - 1) // 7 + 1)
+def week_of_month(d: date) -> int:
+    return int((d.day - 1)//7 + 1)
+
+def normalize_weather(s: str) -> str:
+    t = str(s) if s is not None else ""
+    if "雪" in t: return "雪"
+    if "雨" in t: return "雨"
+    if "曇" in t: return "曇"
+    if "晴" in t: return "晴"
+    return "曇"
+
+def month_weekday_counts(y: int, m: int):
+    start = pd.Timestamp(year=y, month=m, day=1)
+    end = (start + pd.offsets.MonthEnd(1))
+    days = pd.date_range(start, end, freq="D")
+    dow = days.dayofweek
+    counts = {k:int((dow==k).sum()) for k in range(7)}
+    weekday_total = sum(counts[k] for k in range(5))
+    return counts, weekday_total
+
+@st.cache_resource
+def load_artifacts():
+    # Columns
+    arr_cols = json.loads(ARR_COLS_PATH.read_text(encoding="utf-8"))
+    multi_cols = json.loads(MULTI_COLS_PATH.read_text(encoding="utf-8"))
+
+    # Models
+    arr_bst = xgb.Booster()
+    arr_bst.load_model(str(ARR_MODEL_PATH))
+
+    svc_bst = xgb.Booster()
+    svc_bst.load_model(str(SVC_MODEL_PATH))
+
+    wait_bst = xgb.Booster()
+    wait_bst.load_model(str(WAIT_MODEL_PATH))
+
+    # Baseline & Calib
+    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+    calib = json.loads(CALIB_PATH.read_text(encoding="utf-8"))
+
+    return arr_bst, arr_cols, svc_bst, wait_bst, multi_cols, baseline, calib
 
 def _make_zero_df(cols):
     return pd.DataFrame({c: [0] for c in cols})
 
-def _safe_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in out.columns:
-        if out[c].dtype == "O":
-            out[c] = pd.to_numeric(out[c], errors="coerce")
-        out[c] = out[c].fillna(0)
-    return out
+def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    for c in df.columns:
+        if df[c].dtype == "O":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.fillna(0)
 
-def _predict_log1p(booster: xgb.Booster, cols, row_df: pd.DataFrame) -> float:
-    X = _safe_numeric_df(row_df[cols])
+def _predict_booster(bst: xgb.Booster, cols, df: pd.DataFrame) -> float:
+    X = df[cols].copy()
+    X = _coerce_numeric(X)
     dmat = xgb.DMatrix(X, feature_names=list(cols))
-    pred = booster.predict(dmat)
+    if getattr(bst, "best_iteration", None) is not None:
+        pred = bst.predict(dmat, iteration_range=(0, bst.best_iteration + 1))
+    else:
+        pred = bst.predict(dmat)
     return float(pred[0])
 
-@st.cache_resource
-def load_artifacts():
-    # columns
-    arr_cols = json.loads(ARR_COLS_PATH.read_text(encoding="utf-8"))
-    multi_cols = json.loads(MULTI_COLS_PATH.read_text(encoding="utf-8"))
+def baseline_lookup(baseline: dict, table_name: str, month: int, dow: int, slot: int) -> float:
+    # key format: "m_d_slot" (String)
+    table = baseline.get(table_name, {})
+    key = f"{int(month)}_{int(dow)}_{int(slot)}"
+    v = table.get(key, 0.0)
+    return float(v)
 
-    # models
-    arr_booster = xgb.Booster()
-    arr_booster.load_model(str(ARR_MODEL_PATH))
+def slot_index(ts: datetime) -> int:
+    return int((ts.hour - OPEN_HOUR) * 2 + (ts.minute // 30))
 
-    svc_booster = xgb.Booster()
-    svc_booster.load_model(str(SVC_MODEL_PATH))
-
-    wait_booster = xgb.Booster()
-    wait_booster.load_model(str(WAIT_MODEL_PATH))
-
-    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
-    calib = json.loads(CALIB_PATH.read_text(encoding="utf-8"))
-
-    return arr_booster, arr_cols, svc_booster, wait_booster, multi_cols, baseline, calib
-
-def simulate_one_day(target_date: date, total_outpatient_count: int, weather: str) -> pd.DataFrame:
-    arr_booster, arr_cols, svc_booster, wait_booster, multi_cols, baseline, calib = load_artifacts()
-
-    is_h = int(_is_holiday_like(target_date))
-    prev = target_date - timedelta(days=1)
-    is_prev_h = int(_is_holiday_like(prev))
-
-    # time slots
+def generate_time_slots(target_date: date):
     start = datetime(target_date.year, target_date.month, target_date.day, OPEN_HOUR, 0)
     end   = datetime(target_date.year, target_date.month, target_date.day, CLOSE_HOUR, 0)
-    time_slots = pd.date_range(start=start, end=end, freq=f"{FREQ_MIN}min")
+    rng = pd.date_range(start=start, end=end, freq=f"{FREQ_MIN}min")
+    if INCLUDE_CLOSE:
+        return list(rng)
+    close_t = datetime(target_date.year, target_date.month, target_date.day, CLOSE_HOUR, 0)
+    return [t.to_pydatetime() for t in rng if t.to_pydatetime() != close_t]
 
-    if not INCLUDE_CLOSE:
-        time_slots = [t for t in time_slots if not (t.hour == CLOSE_HOUR and t.minute == 0)]
+# ----------------------------
+# シミュレーション本体
+# ----------------------------
+def simulate_one_day(
+    target_date: date,
+    total_outpatient_count: int,
+    weather_text: str
+) -> pd.DataFrame:
+    arr_bst, arr_cols, svc_bst, wait_bst, multi_cols, baseline, calib = load_artifacts()
 
-    # state
-    queue = 0.0
-    lags_arr = [0.0, 0.0, 0.0]  # 30/60/90
-    lags_svc = [0.0, 0.0, 0.0]
-    cum_arr = 0.0
-    cum_svc = 0.0
+    y = target_date.year
+    m = target_date.month
+    d = target_date.day
+    dow = target_date.weekday()
+    is_h = int(is_holiday(target_date))
+    prev_h = int(is_holiday(target_date - timedelta(days=1)))
 
-    wcat = _normalize_weather(weather)
+    counts, weekday_total = month_weekday_counts(y, m)
+    weekday_count_in_month = int(counts.get(dow, 0))
+    weekday_ratio_in_month = float(weekday_count_in_month / weekday_total) if weekday_total > 0 else 0.0
+
+    wcat = normalize_weather(weather_text)
+
+    # 状態変数
+    lags_arr = {"arr_lag_30": 0.0, "arr_lag_60": 0.0, "arr_lag_90": 0.0}
+    lags_svc = {"svc_lag_30": 0.0, "svc_lag_60": 0.0, "svc_lag_90": 0.0}
+    cum_arrivals = 0
+    cum_service = 0
+    queue_at_start = 0.0
+
+    # キャリブレーション定数
+    a = float(calib.get("a", 1.0))
+    b = float(calib.get("b", 0.0))
+    alpha = float(calib.get("alpha", 0.55))
+    floor_ratio = float(calib.get("floor_ratio", 0.90))
+
     results = []
+    for ts in generate_time_slots(target_date):
+        slot = slot_index(ts)
 
-    for ts in time_slots:
-        ts_dt = ts.to_pydatetime()
-        key = _baseline_key(ts_dt)
+        # Baseline
+        arr_base  = baseline_lookup(baseline, "arr_base",  m, dow, slot)
+        svc_base  = baseline_lookup(baseline, "svc_base",  m, dow, slot)
+        wait_base = baseline_lookup(baseline, "wait_base", m, dow, slot)
 
-        # baseline medians
-        arr_base = float(baseline.get("arr_median", {}).get(key, 0.0))
-        svc_base = float(baseline.get("svc_median", {}).get(key, 0.0))
-        wait_base = float(baseline.get("wait_median", {}).get(key, 0.0))
+        # --- 1) Arrivals Model ---
+        cf = _make_zero_df(arr_cols)
+        def set_if(df_target, col, val):
+            if col in df_target.columns:
+                df_target.loc[0, col] = val
 
-        # ----- arrivals features -----
-        af = _make_zero_df(arr_cols)
-        if "hour" in af.columns: af.loc[0, "hour"] = ts_dt.hour
-        if "minute" in af.columns: af.loc[0, "minute"] = ts_dt.minute
-        if "月" in af.columns: af.loc[0, "月"] = ts_dt.month
-        if "週回数" in af.columns: af.loc[0, "週回数"] = _week_of_month(target_date)
-        if "is_holiday" in af.columns: af.loc[0, "is_holiday"] = is_h
-        if "前日祝日フラグ" in af.columns: af.loc[0, "前日祝日フラグ"] = is_prev_h
-        if "total_outpatient_count" in af.columns: af.loc[0, "total_outpatient_count"] = int(total_outpatient_count)
+        # 共通特徴量セット
+        def set_common(df_target):
+            set_if(df_target, "year", y)
+            set_if(df_target, "month", m)
+            set_if(df_target, "dayofweek", dow)
+            set_if(df_target, "is_holiday", is_h)
+            set_if(df_target, "前日祝日フラグ", prev_h)
+            set_if(df_target, "月", m)
+            set_if(df_target, "週回数", week_of_month(target_date))
+            set_if(df_target, "month_weekday_total", weekday_count_in_month)
+            set_if(df_target, "weekday_count_in_month", weekday_count_in_month)
+            set_if(df_target, "weekday_ratio_in_month", weekday_ratio_in_month)
+            set_if(df_target, "total_outpatient_count", int(total_outpatient_count))
+            
+            set_if(df_target, "雨フラグ", 1 if "雨" in wcat else 0)
+            set_if(df_target, "雪フラグ", 1 if "雪" in wcat else 0)
+            set_if(df_target, f"天気カテゴリ_{wcat}", 1)
+            
+            set_if(df_target, "hour", ts.hour)
+            set_if(df_target, "minute", ts.minute)
+            set_if(df_target, f"dayofweek_{dow}", 1)
+            set_if(df_target, "is_first_slot", 1 if (ts.hour==8 and ts.minute==0) else 0)
+            set_if(df_target, "is_second_slot", 1 if (ts.hour==8 and ts.minute==30) else 0)
+            
+            set_if(df_target, "arr_base", float(arr_base))
+            set_if(df_target, "svc_base", float(svc_base))
+            set_if(df_target, "wait_base", float(wait_base))
 
-        # weather flags
-        if "雨フラグ" in af.columns: af.loc[0, "雨フラグ"] = 1 if wcat == "雨" else 0
-        if "雪フラグ" in af.columns: af.loc[0, "雪フラグ"] = 1 if wcat == "雪" else 0
-        for cat in WEATHER_CATS:
-            col = f"天気カテゴリ_{cat}"
-            if col in af.columns:
-                af.loc[0, col] = 1 if wcat == cat else 0
+            set_if(df_target, "queue_at_start_truth", float(queue_at_start))
+            set_if(df_target, "arr_lag_30", float(lags_arr["arr_lag_30"]))
+            set_if(df_target, "arr_lag_60", float(lags_arr["arr_lag_60"]))
+            set_if(df_target, "arr_lag_90", float(lags_arr["arr_lag_90"]))
+            set_if(df_target, "arr_roll_60", float((lags_arr["arr_lag_30"] + lags_arr["arr_lag_60"]) / 2.0))
+            set_if(df_target, "svc_lag_30", float(lags_svc["svc_lag_30"]))
+            set_if(df_target, "svc_lag_60", float(lags_svc["svc_lag_60"]))
+            set_if(df_target, "svc_lag_90", float(lags_svc["svc_lag_90"]))
+            set_if(df_target, "svc_roll_60", float((lags_svc["svc_lag_30"] + lags_svc["svc_lag_60"]) / 2.0))
+            
+            set_if(df_target, "cum_arrivals", int(cum_arrivals))
+            set_if(df_target, "cum_service", int(cum_service))
 
-        # dow one-hot
-        dow = ts_dt.weekday()
-        dcol = f"dayofweek_{dow}"
-        if dcol in af.columns: af.loc[0, dcol] = 1
+        set_common(cf)
+        pred_arr = _predict_booster(arr_bst, arr_cols, cf)
+        arr_i = max(0, int(round(pred_arr)))
 
-        # slot flags
-        if "is_first_slot" in af.columns:  af.loc[0, "is_first_slot"] = 1 if (ts_dt.hour==8 and ts_dt.minute==0) else 0
-        if "is_second_slot" in af.columns: af.loc[0, "is_second_slot"] = 1 if (ts_dt.hour==8 and ts_dt.minute==30) else 0
-
-        # lags / rolling / cumulative / baseline / queue at start
-        if "arr_lag_30" in af.columns: af.loc[0, "arr_lag_30"] = lags_arr[0]
-        if "arr_lag_60" in af.columns: af.loc[0, "arr_lag_60"] = lags_arr[1]
-        if "arr_lag_90" in af.columns: af.loc[0, "arr_lag_90"] = lags_arr[2]
-        if "arr_roll_60" in af.columns: af.loc[0, "arr_roll_60"] = (lags_arr[0] + lags_arr[1]) / 2.0
-        if "cum_arrivals" in af.columns: af.loc[0, "cum_arrivals"] = cum_arr
-        if "queue_at_start_truth" in af.columns: af.loc[0, "queue_at_start_truth"] = queue  # training nameを流用
-        if "arr_base" in af.columns: af.loc[0, "arr_base"] = arr_base
-        if "svc_base" in af.columns: af.loc[0, "svc_base"] = svc_base
-        if "wait_base" in af.columns: af.loc[0, "wait_base"] = wait_base
-
-        pred_log_arr = _predict_log1p(arr_booster, arr_cols, af)
-        pred_arr = max(0.0, float(np.expm1(pred_log_arr)))
-        # baseline anchor（極端な暴走防止）：基準の1/3〜3倍に軽く制限
-        pred_arr = float(np.clip(pred_arr, arr_base*0.33, max(arr_base*3.0, 5.0)))
-        pred_arr_i = int(round(pred_arr))
-
-        # ----- service features (multi) -----
+        # --- 2) Service & Wait Models ---
         mf = _make_zero_df(multi_cols)
-        if "hour" in mf.columns: mf.loc[0, "hour"] = ts_dt.hour
-        if "minute" in mf.columns: mf.loc[0, "minute"] = ts_dt.minute
-        if "月" in mf.columns: mf.loc[0, "月"] = ts_dt.month
-        if "週回数" in mf.columns: mf.loc[0, "週回数"] = _week_of_month(target_date)
-        if "is_holiday" in mf.columns: mf.loc[0, "is_holiday"] = is_h
-        if "前日祝日フラグ" in mf.columns: mf.loc[0, "前日祝日フラグ"] = is_prev_h
-        if "total_outpatient_count" in mf.columns: mf.loc[0, "total_outpatient_count"] = int(total_outpatient_count)
+        set_common(mf) # 同じ特徴量セットを適用（arr_iはまだ入らない。前スロットまでの情報で推論）
 
-        if "雨フラグ" in mf.columns: mf.loc[0, "雨フラグ"] = 1 if wcat == "雨" else 0
-        if "雪フラグ" in mf.columns: mf.loc[0, "雪フラグ"] = 1 if wcat == "雪" else 0
-        for cat in WEATHER_CATS:
-            col = f"天気カテゴリ_{cat}"
-            if col in mf.columns:
-                mf.loc[0, col] = 1 if wcat == cat else 0
+        # Service Predict
+        pred_svc = _predict_booster(svc_bst, multi_cols, mf)
+        svc_i = max(0, int(round(pred_svc)))
 
-        dcol2 = f"dayofweek_{dow}"
-        if dcol2 in mf.columns: mf.loc[0, dcol2] = 1
+        # Queue Update (Conservation)
+        q_next = max(0.0, float(queue_at_start) + float(arr_i) - float(svc_i))
 
-        if "is_first_slot" in mf.columns:  mf.loc[0, "is_first_slot"] = 1 if (ts_dt.hour==8 and ts_dt.minute==0) else 0
-        if "is_second_slot" in mf.columns: mf.loc[0, "is_second_slot"] = 1 if (ts_dt.hour==8 and ts_dt.minute==30) else 0
+        # Wait Model Predict (ML)
+        pred_wait_model = _predict_booster(wait_bst, multi_cols, mf)
+        pred_wait_model = max(0.0, float(pred_wait_model))
 
-        # states (queue/cum/lag) + baseline
-        if "queue_at_start_truth" in mf.columns: mf.loc[0, "queue_at_start_truth"] = queue
-        if "cum_arrivals" in mf.columns: mf.loc[0, "cum_arrivals"] = cum_arr
-        if "cum_service" in mf.columns: mf.loc[0, "cum_service"] = cum_svc
+        # Physics Wait (Queue / Service)
+        # ゼロ除算対策: 処理数が極端に少ない場合の安全策 (最低でも30分で0.5人は進むと仮定)
+        safe_svc = max(float(svc_i), 0.5)
+        wait_phy = (float(queue_at_start) / safe_svc) * 30.0
+        
+        # 物理モデルの暴走防止（上限キャップ）
+        wait_phy = min(wait_phy, 300.0) 
+        wait_phy = max(0.0, a * wait_phy + b)
 
-        if "arr_lag_30" in mf.columns: mf.loc[0, "arr_lag_30"] = lags_arr[0]
-        if "arr_lag_60" in mf.columns: mf.loc[0, "arr_lag_60"] = lags_arr[1]
-        if "arr_lag_90" in mf.columns: mf.loc[0, "arr_lag_90"] = lags_arr[2]
-        if "arr_roll_60" in mf.columns: mf.loc[0, "arr_roll_60"] = (lags_arr[0] + lags_arr[1]) / 2.0
-
-        if "svc_lag_30" in mf.columns: mf.loc[0, "svc_lag_30"] = lags_svc[0]
-        if "svc_lag_60" in mf.columns: mf.loc[0, "svc_lag_60"] = lags_svc[1]
-        if "svc_lag_90" in mf.columns: mf.loc[0, "svc_lag_90"] = lags_svc[2]
-        if "svc_roll_60" in mf.columns: mf.loc[0, "svc_roll_60"] = (lags_svc[0] + lags_svc[1]) / 2.0
-
-        if "arr_base" in mf.columns: mf.loc[0, "arr_base"] = arr_base
-        if "svc_base" in mf.columns: mf.loc[0, "svc_base"] = svc_base
-        if "wait_base" in mf.columns: mf.loc[0, "wait_base"] = wait_base
-
-        # optional: current predicted arrivals can be a feature
-        if "reception_count" in mf.columns: mf.loc[0, "reception_count"] = pred_arr_i
-
-        pred_log_svc = _predict_log1p(svc_booster, multi_cols, mf)
-        pred_svc = max(0.0, float(np.expm1(pred_log_svc)))
-        pred_svc = float(np.clip(pred_svc, svc_base*0.33, max(svc_base*3.0, 5.0)))
-        pred_svc_i = int(round(pred_svc))
-
-        # ----- queue update (conservation) -----
-        queue_next = max(0.0, queue + pred_arr_i - pred_svc_i)
-
-        # ----- wait prediction -----
-        # ML wait
-        if "reception_count" in mf.columns:
-            mf.loc[0, "reception_count"] = pred_arr_i
-        if "call_count" in mf.columns:
-            mf.loc[0, "call_count"] = pred_svc_i
-
-        pred_log_wait = _predict_log1p(wait_booster, multi_cols, mf)
-        wait_ml = max(0.0, float(np.expm1(pred_log_wait)))
-
-        # physics (queue/service) with calibration
-        a = float(calib.get("a", 1.0))
-        b = float(calib.get("b", 0.0))
-        alpha = float(calib.get("alpha", 0.65))
-        floor_ratio = float(calib.get("floor_ratio", 0.70))
-
-        svc_eff = max(1.0, float(pred_svc_i))
-        wait_phy_raw = (float(queue) + 0.5*float(pred_arr_i)) / svc_eff * 30.0
-        wait_phy = max(0.0, a*wait_phy_raw + b)
-
-        # blend + floor
-        wait_blend = alpha*wait_ml + (1.0-alpha)*wait_phy
-        wait_floor = floor_ratio * wait_phy
-        wait_pred = max(wait_blend, wait_floor)
+        # Ensemble
+        wait_blend = alpha * pred_wait_model + (1.0 - alpha) * wait_phy
+        
+        # Baseline Floor (極端な下振れ防止)
+        wait_floor = float(wait_base) * float(floor_ratio)
+        wait_final = max(wait_floor, wait_blend)
 
         results.append({
-            "時間帯": ts_dt.strftime("%H:%M"),
-            "予測受付数": int(pred_arr_i),
-            "予測呼出数": int(pred_svc_i),
-            "予測待ち人数(人)": int(round(queue_next)),
-            "予測平均待ち時間(分)": int(round(wait_pred)),
+            "時間帯": ts.strftime("%H:%M"),
+            "予測受付数": int(arr_i),
+            "予測呼出数(処理数)": int(svc_i),
+            "予測待ち人数(人)": int(round(q_next)),
+            "予測平均待ち時間(分)": int(round(wait_final)),
         })
 
-        # update states
-        queue = queue_next
-        cum_arr += pred_arr_i
-        cum_svc += pred_svc_i
+        # Update State
+        lags_arr = {"arr_lag_30": float(arr_i), "arr_lag_60": float(lags_arr["arr_lag_30"]), "arr_lag_90": float(lags_arr["arr_lag_60"])}
+        lags_svc = {"svc_lag_30": float(svc_i), "svc_lag_60": float(lags_svc["svc_lag_30"]), "svc_lag_90": float(lags_svc["svc_lag_60"])}
 
-        lags_arr = [float(pred_arr_i), lags_arr[0], lags_arr[1]]
-        lags_svc = [float(pred_svc_i), lags_svc[0], lags_svc[1]]
+        cum_arrivals += int(arr_i)
+        cum_service  += int(svc_i)
+        queue_at_start = q_next
 
     return pd.DataFrame(results)
 
+# ----------------------------
+# UI
+# ----------------------------
 def main():
-    st.set_page_config(page_title="A病院 採血 待ち人数・待ち時間 予測（最終版）", layout="wide")
-    st.title("🏥 A病院 採血 待ち人数・待ち時間 予測（最終版・壊れない構造）")
-    st.caption("曜日×時間帯のベースライン＋保存則キュー＋wait物理下限（短すぎ防止）")
+    st.set_page_config(page_title="A病院 予測シミュレータ", layout="wide")
+    st.title("🏥 A病院 採血 待ち時間予測AI")
+    st.caption("Weekday Count, Physics Ensemble, Baseline Floor 搭載版")
 
+    # ファイル存在チェック
     required = [
-        ARR_MODEL_PATH, ARR_COLS_PATH,
-        SVC_MODEL_PATH, WAIT_MODEL_PATH, MULTI_COLS_PATH,
-        BASELINE_PATH, CALIB_PATH
+        ARR_MODEL_PATH, SVC_MODEL_PATH, WAIT_MODEL_PATH,
+        ARR_COLS_PATH, MULTI_COLS_PATH, BASELINE_PATH, CALIB_PATH
     ]
     missing = [p.name for p in required if not p.exists()]
     if missing:
-        st.error("models/ に必要ファイルが不足しています:\n\n" + "\n".join(missing))
+        st.error(f"以下のモデルファイルが見つかりません。models/フォルダを確認してください:\n\n" + "\n".join(missing))
         st.stop()
 
     with st.sidebar:
-        st.header("入力")
+        st.header("条件設定")
         target = st.date_input("予測対象日", value=date.today() + timedelta(days=1))
-        total_out = st.number_input("延べ外来患者数", min_value=0, value=1200, step=10)
-        weather = st.selectbox("天気（簡易）", ["晴", "曇", "雨", "雪", "快晴", "薄曇"], index=0)
-        run = st.button("予測実行", type="primary")
+        
+        # デフォルト値を過去の中央値あたりに設定
+        total_out = st.number_input("予測来院患者数(延べ)", min_value=0, value=1200, step=10, help="病院全体の予測来院数")
+        
+        weather = st.selectbox("天気予報", ["晴", "曇", "雨", "雪", "快晴", "薄曇"], index=1)
+        
+        run = st.button("シミュレーション実行", type="primary")
 
         st.divider()
-        st.subheader("読込ファイル")
-        st.write("arrivals:", ARR_MODEL_PATH.name)
-        st.write("service :", SVC_MODEL_PATH.name)
-        st.write("wait    :", WAIT_MODEL_PATH.name)
-        st.write("baseline:", BASELINE_PATH.name)
-        st.write("calib   :", CALIB_PATH.name)
-
+        st.markdown("**モデル情報**")
+        st.caption(f"Wait Model α: {load_artifacts()[6].get('alpha', 'N/A')}")
+        
     if run:
-        with st.spinner("計算中..."):
+        with st.spinner("AIが推論中..."):
             df = simulate_one_day(target, int(total_out), str(weather))
-        st.success(f"{target} の予測が完了しました。")
+        
+        st.success(f"📅 {target.strftime('%Y-%m-%d')} の予測完了")
 
-        c1, c2 = st.columns([2, 3], gap="large")
-        with c1:
-            st.subheader("結果テーブル")
-            st.dataframe(df, use_container_width=True, hide_index=True)
+        # メトリクス表示
+        avg_wait = df["予測平均待ち時間(分)"].mean()
+        max_wait = df["予測平均待ち時間(分)"].max()
+        peak_idx = df["予測平均待ち時間(分)"].idxmax()
+        peak_time = df.loc[peak_idx, "時間帯"]
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("平均待ち時間", f"{avg_wait:.1f} 分")
+        m2.metric("最大待ち時間", f"{max_wait} 分", f"@{peak_time}")
+        m3.metric("総受付数", f"{df['予測受付数'].sum()} 人")
+
+        # グラフ
+        st.subheader("予測チャート")
+        chart_data = df.set_index("時間帯")[["予測平均待ち時間(分)", "予測待ち人数(人)"]]
+        st.line_chart(chart_data)
+
+        # テーブル
+        with st.expander("詳細データを見る", expanded=True):
+            st.dataframe(df, use_container_width=True)
             csv = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button("CSVダウンロード", data=csv, file_name=f"A_predict_{target}.csv", mime="text/csv")
-
-        with c2:
-            st.subheader("可視化")
-            st.line_chart(df.set_index("時間帯")[["予測平均待ち時間(分)"]])
-            st.bar_chart(df.set_index("時間帯")[["予測待ち人数(人)"]])
-
-    st.divider()
-    st.caption("※ 本アプリは“短すぎ崩壊”を避けるため、待ち時間に物理下限（queue/service）を適用しています。")
+            st.download_button("CSVダウンロード", data=csv, file_name=f"predict_{target}.csv", mime="text/csv")
 
 if __name__ == "__main__":
     main()
