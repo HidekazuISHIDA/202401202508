@@ -1,1 +1,0 @@
-{"features": ["month", "dow", "is_holiday", "week_of_month", "hour", "minute", "slot_id", "total_outpatient", "rain", "temp", "is_\u6674", "is_\u66c7", "is_\u96e8", "is_\u96ea"], "config": {"OPEN_TIME": "08:00", "CLOSE_TIME": "17:30", "FREQ": "30T", "WAIT_MAX_MINUTES": 180, "SEED": 42}}
