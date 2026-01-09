@@ -57,7 +57,7 @@ def month_weekday_counts(y, m):
     counts = {k:int((days.dayofweek==k).sum()) for k in range(7)}
     return counts, sum(counts[k] for k in range(5))
 
-# 気象データ自動補完
+# ★ここが重要: 気象データを自動で埋める関数 (0予測防止)
 def get_default_weather_metrics(month, weather_text):
     monthly_temps = {1:5.0, 2:6.0, 3:10.0, 4:15.0, 5:20.0, 6:24.0, 7:28.0, 8:29.0, 9:25.0, 10:19.0, 11:13.0, 12:7.0}
     temp = monthly_temps.get(month, 15.0)
@@ -96,7 +96,7 @@ def generate_slots(target_date):
     rng = pd.date_range(start, end, freq=f"30min")
     return [t.to_pydatetime() for t in rng if t.to_pydatetime() != end]
 
-# --- Simulation Core (Pure AI) ---
+# --- Simulation (Pure AI) ---
 def simulate_one_day(target_date, total_pat, weather_text):
     arr_bst, arr_cols, svc_bst, wait_bst, multi_cols, baseline, calib = load_artifacts()
 
@@ -111,8 +111,8 @@ def simulate_one_day(target_date, total_pat, weather_text):
     lags_svc = {"svc_lag_30":0.0, "svc_lag_60":0.0, "svc_lag_90":0.0}
     cum_arr, cum_svc, q_start = 0, 0, 0.0
     
-    # Calibration is disabled (Pure AI)
-    a, b, alpha, floor_ratio = 1.0, 0.0, 1.0, 1.0
+    # Pure AI Mode (alpha=1.0)
+    alpha, floor_ratio = 1.0, 1.0
 
     results = []
     
@@ -136,6 +136,7 @@ def simulate_one_day(target_date, total_pat, weather_text):
             df.loc[0, "雪フラグ"] = 1 if "雪" in wcat else 0
             for c in ["晴", "曇", "雨", "雪"]:
                 if f"天気カテゴリ_{c}" in df.columns: df.loc[0, f"天気カテゴリ_{c}"] = 1 if c == wcat else 0
+            # 数値気象データを埋める
             for k, v in w_metrics.items():
                 if k in df.columns: df.loc[0, k] = v
             
@@ -174,12 +175,12 @@ def simulate_one_day(target_date, total_pat, weather_text):
             mf.loc[0, "queue_density"] = float(q_start) / (float(arr_i) + 1.0)
 
         svc_i = max(0, int(round(_predict_booster(svc_bst, multi_cols, mf))))
-        # Minimal Safety for Ghost Queue
+        # Minimal Ghost Queue Prevention
         if q_start >= 0.5 and svc_i == 0: svc_i = 1
 
         q_next = max(0.0, float(q_start) + float(arr_i) - float(svc_i))
 
-        # Pure AI Prediction
+        # Pure AI Wait Prediction
         raw_wait = _predict_booster(wait_bst, multi_cols, mf)
         wait_val = max(0.0, float(np.expm1(raw_wait)))
         
@@ -204,7 +205,7 @@ def simulate_one_day(target_date, total_pat, weather_text):
 def main():
     st.set_page_config(page_title="A病院 混雑予測", layout="wide")
     st.title("🏥 A病院 採血 待ち時間予測AI")
-    st.caption("Ver 8.1: Pure AI & Lightweight")
+    st.caption("Ver 8.2: Pure AI & Lightweight")
 
     required = [ARR_MODEL_PATH, SVC_MODEL_PATH, WAIT_MODEL_PATH, ARR_COLS_PATH, MULTI_COLS_PATH, BASELINE_PATH]
     if any(not p.exists() for p in required):
