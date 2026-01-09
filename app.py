@@ -1,7 +1,8 @@
-
 import json
 from pathlib import Path
 from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -24,6 +25,18 @@ OPEN_HOUR = 8
 CLOSE_HOUR = 18
 FREQ_MIN = 30
 
+# -----------------------------
+# Timezone (JST fixed)
+# -----------------------------
+JST = ZoneInfo("Asia/Tokyo")
+
+def jst_today() -> date:
+    """Return today's date in JST (avoid UTC drift on Streamlit Cloud)."""
+    return datetime.now(JST).date()
+
+# -----------------------------
+# Holiday / Weather helpers
+# -----------------------------
 def _load_holidays() -> set:
     if not HOLIDAY_CSV_PATH.exists():
         return set()
@@ -41,13 +54,34 @@ def _load_holidays() -> set:
 HOLIDAYS = _load_holidays()
 
 def is_holiday(d: date) -> bool:
+    # weekend
     if d.weekday() >= 5:
         return True
+    # national holiday (CSV)
     if d in HOLIDAYS:
         return True
+    # year-end / new-year (custom rule)
     if (d.month == 12 and d.day >= 29) or (d.month == 1 and d.day <= 3):
         return True
     return False
+
+def normalize_weather(w: str) -> str:
+    """
+    Normalize weather categories to the 4 base types:
+    晴 / 曇 / 雨 / 雪
+    so that one-hot columns match training features.
+    """
+    if not w:
+        return ""
+    if "雪" in w:
+        return "雪"
+    if "雨" in w:
+        return "雨"
+    if "曇" in w:
+        return "曇"
+    if "晴" in w:
+        return "晴"
+    return ""
 
 @st.cache_resource
 def load_models_and_columns():
@@ -80,19 +114,32 @@ def _predict_booster(booster: xgb.Booster, cols, df: pd.DataFrame) -> float:
 def simulate_one_day(target_date: date, total_outpatient_count: int, weather: str) -> pd.DataFrame:
     count_booster, count_cols, wait_booster, queue_booster, multi_cols = load_models_and_columns()
 
+    # holiday flags
     is_h = is_holiday(target_date)
     prev = target_date - timedelta(days=1)
     is_prev_h = is_holiday(prev)
 
+    # time slots (exclude CLOSE_HOUR exactly to avoid unseen slot e.g., 18:00)
     start = datetime(target_date.year, target_date.month, target_date.day, OPEN_HOUR, 0)
     end   = datetime(target_date.year, target_date.month, target_date.day, CLOSE_HOUR, 0)
-    time_slots = pd.date_range(start=start, end=end, freq=f"{FREQ_MIN}min")
+    # Use inclusive="left" when available (pandas >= 1.4)
+    try:
+        time_slots = pd.date_range(start=start, end=end, freq=f"{FREQ_MIN}min", inclusive="left")
+    except TypeError:
+        # fallback for older pandas: manually exclude end
+        time_slots = pd.date_range(start=start, end=end - timedelta(minutes=FREQ_MIN), freq=f"{FREQ_MIN}min")
+
+    # weather normalized
+    wcat = normalize_weather(weather)
 
     lags = {"lag_30min": 0.0, "lag_60min": 0.0, "lag_90min": 0.0}
     queue_at_start = 0
 
     results = []
     for ts in time_slots:
+        # -------------------------
+        # reception count model features
+        # -------------------------
         cf = _make_zero_df(count_cols)
 
         if "hour" in cf.columns: cf.loc[0, "hour"] = int(ts.hour)
@@ -103,13 +150,16 @@ def simulate_one_day(target_date: date, total_outpatient_count: int, weather: st
         if "total_outpatient_count" in cf.columns: cf.loc[0, "total_outpatient_count"] = int(total_outpatient_count)
         if "is_holiday" in cf.columns: cf.loc[0, "is_holiday"] = int(is_h)
 
-        if "雨フラグ" in cf.columns: cf.loc[0, "雨フラグ"] = 1 if ("雨" in weather) else 0
-        if "雪フラグ" in cf.columns: cf.loc[0, "雪フラグ"] = 1 if ("雪" in weather) else 0
+        # simple weather flags (work with normalized category too)
+        if "雨フラグ" in cf.columns: cf.loc[0, "雨フラグ"] = 1 if (wcat == "雨") else 0
+        if "雪フラグ" in cf.columns: cf.loc[0, "雪フラグ"] = 1 if (wcat == "雪") else 0
 
-        wcat = weather[0] if weather else ""
-        wcol = f"天気カテゴリ_{wcat}"
-        if wcol in cf.columns: cf.loc[0, wcol] = 1
+        # one-hot weather category
+        if wcat:
+            wcol = f"天気カテゴリ_{wcat}"
+            if wcol in cf.columns: cf.loc[0, wcol] = 1
 
+        # day-of-week one-hot (0=Mon ... 6=Sun)
         dcol = f"dayofweek_{ts.dayofweek}"
         if dcol in cf.columns: cf.loc[0, dcol] = 1
 
@@ -122,7 +172,11 @@ def simulate_one_day(target_date: date, total_outpatient_count: int, weather: st
         pred_reception = _predict_booster(count_booster, count_cols, cf)
         pred_reception_i = max(0, int(round(float(pred_reception))))
 
+        # -------------------------
+        # multi (queue/wait) model features
+        # -------------------------
         mf = _make_zero_df(multi_cols)
+
         if "hour" in mf.columns: mf.loc[0, "hour"] = int(ts.hour)
         if "minute" in mf.columns: mf.loc[0, "minute"] = int(ts.minute)
         if "reception_count" in mf.columns: mf.loc[0, "reception_count"] = int(pred_reception_i)
@@ -132,10 +186,14 @@ def simulate_one_day(target_date: date, total_outpatient_count: int, weather: st
         if "前日祝日フラグ" in mf.columns: mf.loc[0, "前日祝日フラグ"] = int(is_prev_h)
         if "total_outpatient_count" in mf.columns: mf.loc[0, "total_outpatient_count"] = int(total_outpatient_count)
         if "is_holiday" in mf.columns: mf.loc[0, "is_holiday"] = int(is_h)
-        if "雨フラグ" in mf.columns: mf.loc[0, "雨フラグ"] = 1 if ("雨" in weather) else 0
-        if "雪フラグ" in mf.columns: mf.loc[0, "雪フラグ"] = 1 if ("雪" in weather) else 0
-        wcol2 = f"天気カテゴリ_{wcat}"
-        if wcol2 in mf.columns: mf.loc[0, wcol2] = 1
+
+        if "雨フラグ" in mf.columns: mf.loc[0, "雨フラグ"] = 1 if (wcat == "雨") else 0
+        if "雪フラグ" in mf.columns: mf.loc[0, "雪フラグ"] = 1 if (wcat == "雪") else 0
+
+        if wcat:
+            wcol2 = f"天気カテゴリ_{wcat}"
+            if wcol2 in mf.columns: mf.loc[0, wcol2] = 1
+
         dcol2 = f"dayofweek_{ts.dayofweek}"
         if dcol2 in mf.columns: mf.loc[0, dcol2] = 1
 
@@ -152,7 +210,12 @@ def simulate_one_day(target_date: date, total_outpatient_count: int, weather: st
             "予測平均待ち時間(分)": pred_wait_i,
         })
 
-        lags = {"lag_30min": float(pred_reception_i), "lag_60min": float(lags["lag_30min"]), "lag_90min": float(lags["lag_60min"])}
+        # update lags/queue for next slot
+        lags = {
+            "lag_30min": float(pred_reception_i),
+            "lag_60min": float(lags["lag_30min"]),
+            "lag_90min": float(lags["lag_60min"])
+        }
         queue_at_start = pred_queue_i
 
     return pd.DataFrame(results)
@@ -164,9 +227,19 @@ def main():
 
     with st.sidebar:
         st.header("入力")
-        target = st.date_input("予測対象日", value=date.today() + timedelta(days=1))
+
+        # Debug (optional): helps confirm UTC/JST drift quickly
+        with st.expander("デバッグ（時刻/日付）", expanded=False):
+            st.write("server date.today():", date.today())
+            st.write("JST today:", jst_today())
+
+        target = st.date_input("予測対象日", value=jst_today() + timedelta(days=1))
         total_out = st.number_input("延べ外来患者数", min_value=0, value=1200, step=10)
+
+        # keep options, but normalize internally
         weather = st.selectbox("天気（簡易）", ["晴", "曇", "雨", "雪", "快晴", "薄曇"], index=0)
+        st.caption(f"天気カテゴリ（内部）: {normalize_weather(str(weather)) or '(未設定)'}")
+
         run = st.button("シミュレーション実行", type="primary")
 
         st.divider()
@@ -179,16 +252,17 @@ def main():
     for p in [COUNT_MODEL_PATH, WAIT_MODEL_PATH, QUEUE_MODEL_PATH, COUNT_COLS_PATH, MULTI_COLS_PATH]:
         if not p.exists():
             missing.append(p.name)
+
     if missing:
         st.error(
-    """必要ファイルが不足しています。
-models/ に以下を配置してください：
-
-- model_A_timeseries.json
-- columns_A_timeseries.json
-"""
-)
-
+            "必要ファイルが不足しています。\n"
+            "models/ に以下を配置してください：\n\n"
+            "- model_A_timeseries.json\n"
+            "- columns_A_timeseries.json\n"
+            "- model_A_waittime_30min.json\n"
+            "- model_A_queue_30min.json\n"
+            "- columns_A_multi_30min.json\n"
+        )
         st.stop()
 
     if run:
