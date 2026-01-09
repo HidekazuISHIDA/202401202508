@@ -1,4 +1,6 @@
-streamlit==1.41.1
-pandas==2.2.3
-numpy==1.26.4
-xgboost==2.0.3
+streamlit>=1.30
+pandas>=1.5
+numpy>=1.23
+xgboost>=1.6
+scikit-learn>=1.2
+python-dateutil>=2.8
